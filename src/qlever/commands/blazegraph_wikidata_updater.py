@@ -23,6 +23,12 @@ from qlever.commands.update_wikidata import UpdateWikidataCommand
 from qlever.log import log
 
 
+DEFAULT_BLAZEGRAPH_USER_AGENT = (
+    "Geneea-BlazegraphUpdater/1.0"
+    " (https://geneea.com; sysadmin@geneea.com)"
+)
+
+
 class BlazegraphWikidataUpdater(UpdateWikidataCommand):
     """Subclass that overrides only what differs for Blazegraph."""
 
@@ -137,6 +143,16 @@ def main() -> None:
         help=(
             "Blazegraph SPARQL endpoint URL, e.g. "
             "http://localhost:9999/bigdata/namespace/wdq/sparql"
+        ),
+    )
+    parser.add_argument(
+        "--user-agent",
+        type=str,
+        default=DEFAULT_BLAZEGRAPH_USER_AGENT,
+        help=(
+            "User-Agent header for the SSE stream connection. "
+            "Wikimedia policy requires a descriptive string with contact info "
+            "(default: %(default)s)"
         ),
     )
 

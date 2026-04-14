@@ -33,7 +33,12 @@ def custom_cast_lexical_to_python(lexical, datatype):
 rdflib.term._castLexicalToPython = custom_cast_lexical_to_python
 
 
-def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
+DEFAULT_USER_AGENT = "qlever update-wikidata"
+
+
+def connect_to_sse_stream(
+    sse_stream_url, since=None, event_id=None, user_agent=None,
+):
     """
     Connect to the SSE stream and return the connected EventSource.
 
@@ -41,17 +46,21 @@ def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
         sse_stream_url: URL of the SSE stream
         since: ISO date string to start from (mutually exclusive with event_id)
         event_id: Event ID to resume from (mutually exclusive with since)
+        user_agent: User-Agent header value (default: qlever update-wikidata)
 
     Returns:
         The connected EventSource object
     """
+    if user_agent is None:
+        user_agent = DEFAULT_USER_AGENT
+
     if event_id:
         event_id_json = json.dumps(event_id)
         source = requests_sse.EventSource(
             sse_stream_url,
             headers={
                 "Accept": "text/event-stream",
-                "User-Agent": "qlever update-wikidata",
+                "User-Agent": user_agent,
                 "Last-Event-ID": event_id_json,
             },
         )
@@ -61,7 +70,7 @@ def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
             params={"since": since} if since else {},
             headers={
                 "Accept": "text/event-stream",
-                "User-Agent": "qlever update-wikidata",
+                "User-Agent": user_agent,
             },
         )
 
@@ -614,7 +623,8 @@ class UpdateWikidataCommand(QleverCommand):
             try:
                 source = self.retry_with_backoff(
                     lambda: connect_to_sse_stream(
-                        args.sse_stream_url, since=since
+                        args.sse_stream_url, since=since,
+                        user_agent=getattr(args, "user_agent", None),
                     ),
                     "SSE stream connection",
                     args.num_retries,
@@ -716,6 +726,7 @@ class UpdateWikidataCommand(QleverCommand):
                         args.sse_stream_url,
                         since=since if not event_id_for_next_batch else None,
                         event_id=event_id_for_next_batch,
+                        user_agent=getattr(args, "user_agent", None),
                     ),
                     "SSE stream connection for batch processing",
                     args.num_retries,
