@@ -31,12 +31,22 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
     ) -> dict | str:
         """Parse a Blazegraph SPARQL UPDATE response.
 
-        Blazegraph returns XML like::
+        Blazegraph may return either:
+
+        1. Clean XML::
 
             <?xml version="1.0"?>
             <data modified="123" milliseconds="456"/>
 
-        or an HTML error page on failure.
+        2. An HTML page with stats in ``<p>`` tags (common for the
+           default SPARQL endpoint)::
+
+            <html>…
+            <p>totalElapsed=40ms, …, mutationCount=27</p>
+            <p>COMMIT: totalElapsed=988ms, commitTime=…, mutationCount=27</p>
+            </html>
+
+        3. An HTML error page on real failures.
         """
         result = result.strip()
 
@@ -46,7 +56,7 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
             log.info("Blazegraph returned empty response (no-op update)")
             return {"time_total_ms": 0}
 
-        # Try XML parse first (the normal success case).
+        # Try clean XML first (<data modified="N" milliseconds="M"/>).
         try:
             root = ET.fromstring(result)
             modified = root.attrib.get("modified", "?")
@@ -61,9 +71,42 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
         except ET.ParseError:
             pass
 
-        # Not valid XML — check for common HTML error markers.
-        if "<html" in result.lower() or "<title>" in result.lower():
-            # Try to extract a meaningful error message.
+        # HTML response — Blazegraph wraps successful UPDATE results in
+        # HTML with statistics in <p> tags.  Look for the COMMIT line
+        # which confirms the transaction completed.
+        commit_match = re.search(
+            r"COMMIT:.*?totalElapsed=(\d+)ms.*?mutationCount=(\d+)",
+            result,
+        )
+        if commit_match:
+            total_elapsed_ms = int(commit_match.group(1))
+            mutation_count = int(commit_match.group(2))
+            verbose = getattr(args, "verbose", "no")
+            if verbose == "yes":
+                log.info(
+                    f"Blazegraph: mutationCount={mutation_count}, "
+                    f"totalElapsed={total_elapsed_ms}ms"
+                )
+            return {"time_total_ms": total_elapsed_ms}
+
+        # Also accept the non-COMMIT stats line (update without commit info).
+        stats_match = re.search(
+            r"totalElapsed=(\d+)ms.*?mutationCount=(\d+)",
+            result,
+        )
+        if stats_match:
+            total_elapsed_ms = int(stats_match.group(1))
+            mutation_count = int(stats_match.group(2))
+            verbose = getattr(args, "verbose", "no")
+            if verbose == "yes":
+                log.info(
+                    f"Blazegraph: mutationCount={mutation_count}, "
+                    f"totalElapsed={total_elapsed_ms}ms"
+                )
+            return {"time_total_ms": total_elapsed_ms}
+
+        # If we got HTML but no recognizable stats, it's likely an error.
+        if "<html" in result.lower():
             title_match = re.search(
                 r"<title>(.*?)</title>", result, re.IGNORECASE | re.DOTALL,
             )
