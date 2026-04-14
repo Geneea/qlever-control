@@ -25,7 +25,7 @@ from qlever.log import log
 
 DEFAULT_BLAZEGRAPH_USER_AGENT = (
     "Geneea-BlazegraphUpdater/1.0"
-    " (https://geneea.com; sysadmin@geneea.com)"
+    " (https://geneea.com; support@geneea.com)"
 )
 
 
