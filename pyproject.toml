@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "geneea-wikidata-updater"
 description = "Keep a self-hosted Blazegraph synchronized with Wikidata via the public RDF update stream"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
     { name = "Geneea", email = "support@geneea.com" }
 ]
@@ -23,7 +23,7 @@ classifiers = [
 
 # Trimmed: argcomplete and pyyaml are only needed by the full qlever CLI,
 # not by the Blazegraph updater.
-dependencies = ["psutil", "termcolor", "rdflib", "requests-sse", "tqdm>=4.60.0"]
+dependencies = ["psutil", "termcolor", "requests", "rdflib", "requests-sse", "tqdm>=4.60.0"]
 
 [project.urls]
 homepage = "https://github.com/Geneea/qlever-control"
