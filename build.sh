@@ -50,7 +50,7 @@ function venv_start() {
         uv venv -p ${PYTHON_VER} $VENV
     fi
     source $VENV/bin/activate
-    uv pip install -U 'tox~=4.34'
+    uv pip install -U pytest pytest-cov
 }
 
 # deactivate and delete $VENV virtual environment
@@ -73,17 +73,17 @@ echo "Running build..."
 echo "--------------------------------"
 uv build --wheel --no-create-gitignore
 
-if [[ $KEEPENV -gt 0 ]]; then
-    echo "--------------------------------"
-    echo "Installing the package in development mode..."
-    echo "--------------------------------"
-    uv pip install -e .
-fi
+echo "--------------------------------"
+echo "Installing the package and test dependencies..."
+echo "--------------------------------"
+uv pip install -e .
+# pyyaml and argcomplete are needed by upstream tests but not by the updater itself
+uv pip install pyyaml argcomplete
 
 echo "--------------------------------"
-echo "Running tests and linting..."
+echo "Running tests..."
 echo "--------------------------------"
-uvx --isolated --with tox-uv -p $PYTHON_VER "tox>=4.30,<5.0"
+pytest -v
 
 # upload to pypi.dev.g
 if [[ $UPLOAD -gt 0 ]]; then
