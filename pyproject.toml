@@ -3,42 +3,47 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "qlever"
-description = "Command-line tool for using the QLever graph database"
-version = "0.5.45"
+name = "geneea-wikidata-updater"
+description = "Keep a self-hosted Blazegraph synchronized with Wikidata via the public RDF update stream"
+version = "0.1.0"
 authors = [
-    { name = "Hannah Bast", email = "bast@cs.uni-freiburg.de" }
+    { name = "Geneea", email = "support@geneea.com" }
 ]
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.8"
 
-keywords = ["Graph database", "Triplestore", "Knowledge graphs", "SPARQL", "RDF"]
+keywords = ["Wikidata", "Blazegraph", "SPARQL", "RDF", "triplestore"]
 
 classifiers = [
  "Topic :: Database :: Database Engines/Servers",
  "Topic :: Database :: Front-Ends"
 ]
 
-dependencies = [ "psutil", "termcolor", "argcomplete", "pyyaml", "rdflib", "requests-sse", "tqdm>=4.60.0" ]
+# Trimmed: argcomplete and pyyaml are only needed by the full qlever CLI,
+# not by the Blazegraph updater.
+dependencies = ["psutil", "termcolor", "rdflib", "requests-sse", "tqdm>=4.60.0"]
 
 [project.urls]
-homepage = "https://github.com/ad-freiburg/qlever"
-documentation = "https://docs.qlever.dev"
-repository = "https://github.com/ad-freiburg/qlever.git"
-bugtracker = "https://github.com/ad-freiburg/qlever/issues"
+homepage = "https://github.com/Geneea/qlever-control"
+repository = "https://github.com/Geneea/qlever-control.git"
+bugtracker = "https://github.com/Geneea/qlever-control/issues"
 
 [project.scripts]
-"qlever" = "qlever.qlever_main:main"
+"geneea-wikidata-updater" = "qlever.commands.blazegraph_wikidata_updater:main"
 
-[tool.setuptools]
-package-data = { "qlever" = ["Qleverfiles/*"] }
+# Only ship the qlever core and commands packages (no Qleverfiles data).
+# Note: setuptools cannot exclude individual .py files from a package,
+# so unused command modules are included but never imported by the wrapper.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["qlever", "qlever.commands"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 
 [tool.ruff]
-line-length = 79 
+line-length = 79
 [tool.ruff.lint]
 extend-select = ["I"]
