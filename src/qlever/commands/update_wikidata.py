@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Event
 
 import rdflib.term
+import requests
 import requests_sse
 from rdflib import Graph
 from termcolor import colored
@@ -20,7 +21,6 @@ from tqdm.contrib.logging import tqdm_logging_redirect
 
 from qlever.command import QleverCommand
 from qlever.log import log
-from qlever.util import run_command
 
 
 # Monkey patch `rdflib.term._castLexicalToPython` to avoid casting of literals
@@ -97,16 +97,18 @@ def get_next_offset_from_endpoint(sparql_endpoint):
         "wikibase:updateStreamNextOffset ?offset "
         "}"
     )
-    curl_cmd_check_offset = (
-        f"curl -s {sparql_endpoint}"
-        f' -H "Accept: text/csv"'
-        f' -H "Content-type: application/sparql-query"'
-        f' --data "{sparql_query_offset}"'
+    response = requests.post(
+        sparql_endpoint,
+        headers={
+            "Accept": "text/csv",
+            "Content-Type": "application/sparql-query",
+        },
+        data=sparql_query_offset,
     )
-    result = run_command(
-        f"{curl_cmd_check_offset} | sed 1d",
-        return_output=True,
-    ).strip()
+    response.raise_for_status()
+    # Skip CSV header line (equivalent of the previous `| sed 1d`).
+    lines = response.text.strip().splitlines()
+    result = lines[1].strip() if len(lines) > 1 else ""
     if not result:
         raise Exception("Query returned no results")
     return int(result.strip('"'))
@@ -492,7 +494,7 @@ class UpdateWikidataCommand(QleverCommand):
             except Exception as e:
                 log.warn(
                     f"Error extracting statistics: {e}, "
-                    f"curl command was: {curl_cmd}"
+                    f"request was: {curl_cmd}"
                 )
                 # Show traceback for debugging.
                 import traceback
@@ -558,20 +560,13 @@ class UpdateWikidataCommand(QleverCommand):
         # cURL command to get the date until which the updates of the
         # SPARQL endpoint are complete.
         sparql_endpoint = getattr(args, "sparql_endpoint", None) or f"http://{args.host_name}:{args.port}"
-        curl_cmd_updates_complete_until = (
-            f"curl -s {sparql_endpoint}"
-            f' -H "Accept: text/csv"'
-            f' -H "Content-type: application/sparql-query"'
-            f' --data "{self.sparql_updates_complete_until_query}"'
-        )
-
         # Construct the command and show it.
         cmd_description = []
         if args.since:
             cmd_description.append(f"SINCE={args.since}")
         else:
             cmd_description.append(
-                f"SINCE=$({curl_cmd_updates_complete_until} | sed 1d)"
+                f"SINCE=<from SPARQL endpoint at {sparql_endpoint}>"
             )
         if args.until:
             cmd_description.append(f"UNTIL={args.until}")
@@ -589,13 +584,21 @@ class UpdateWikidataCommand(QleverCommand):
             since = args.since
         else:
             try:
-                since = run_command(
-                    f"{curl_cmd_updates_complete_until} | sed 1d",
-                    return_output=True,
-                ).strip()
+                response = requests.post(
+                    sparql_endpoint,
+                    headers={
+                        "Accept": "text/csv",
+                        "Content-Type": "application/sparql-query",
+                    },
+                    data=self.sparql_updates_complete_until_query,
+                )
+                response.raise_for_status()
+                lines = response.text.strip().splitlines()
+                since = lines[1].strip() if len(lines) > 1 else ""
             except Exception as e:
                 log.error(
-                    f"Error running `{curl_cmd_updates_complete_until}`: {e}"
+                    f"Error querying SPARQL endpoint for "
+                    f"updates_complete_until: {e}"
                 )
                 return False
 
@@ -1196,18 +1199,12 @@ class UpdateWikidataCommand(QleverCommand):
                     )
                     delete_insert_operation += ";\n" + delete_where_operation
 
-            # Construct curl command. For batch size 1, send the operation via
-            # `--data-urlencode`, otherwise write to file and send via `--data-binary`.
+            # Prepare the SPARQL UPDATE request.
             access_token = getattr(args, "access_token", None)
             endpoint_url = (
                 f"{sparql_endpoint}?access-token={access_token}"
                 if access_token
                 else sparql_endpoint
-            )
-            curl_cmd = (
-                f"curl -s -X POST"
-                f' "{endpoint_url}"'
-                f" -H 'Content-Type: application/sparql-update'"
             )
             if use_cached_file:
                 # Use the cached file instead of writing a new one
@@ -1223,9 +1220,9 @@ class UpdateWikidataCommand(QleverCommand):
                 )
                 with open(meta_file_name, "w") as f:
                     f.write(f"{date_list[0]} - {date_list[-1]}")
-            curl_cmd += f" --data-binary @{update_arg_file_name}"
+            request_desc = f"POST {endpoint_url} @{update_arg_file_name}"
             if args.verbose == "yes":
-                log.info(colored(curl_cmd, "blue"))
+                log.info(colored(request_desc, "blue"))
 
             # Send the UPDATE request. If it fails, reset to the beginning
             # of this batch and retry in the next iteration of the outer
@@ -1234,7 +1231,14 @@ class UpdateWikidataCommand(QleverCommand):
             # restarted, the offset check at the beginning of the next
             # iteration will detect the mismatch and rewind.
             try:
-                result = run_command(curl_cmd, return_output=True)
+                with open(update_arg_file_name, "rb") as f:
+                    update_data = f.read()
+                response = requests.post(
+                    endpoint_url,
+                    headers={"Content-Type": "application/sparql-update"},
+                    data=update_data,
+                )
+                result = response.text
             except Exception:
                 if self.ctrl_c_pressed.is_set():
                     log.warn(
@@ -1303,7 +1307,7 @@ class UpdateWikidataCommand(QleverCommand):
 
             # Parse the result and log statistics.  Subclasses may
             # override ``parse_update_result`` for different backends.
-            parse_status = self.parse_update_result(result, args, curl_cmd)
+            parse_status = self.parse_update_result(result, args, request_desc)
             if parse_status == "error":
                 return False
             if parse_status == "retry":
