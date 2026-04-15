@@ -304,6 +304,26 @@ class UpdateWikidataCommand(QleverCommand):
                     # If this was the last attempt, re-raise the exception.
                     raise
 
+    def _iter_sse_events(self, source):
+        """
+        Yield events from the SSE source, catching connection errors
+        (including HTTP 429) so that the caller can handle a partial or
+        empty batch gracefully instead of crashing.
+        """
+        try:
+            for event in source:
+                yield event
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.HTTPError,
+            requests.exceptions.Timeout,
+        ) as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None:
+                log.warn(f"SSE stream returned HTTP {status}: {e}")
+            else:
+                log.warn(f"SSE stream connection error: {e}")
+
     # Handle Ctrl+C gracefully by finishing the current batch and then exiting.
     def handle_ctrl_c(self, signal_received, frame):
         if self.ctrl_c_pressed.is_set():
@@ -861,7 +881,7 @@ class UpdateWikidataCommand(QleverCommand):
                     leave=False,
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}",
                 ) as pbar:
-                    for event in source:
+                    for event in self._iter_sse_events(source):
                         # Skip events that are not of type `message` (should not
                         # happen), have no field `data` (should not happen either), or
                         # where the topic is not in `args.topics` (one topic by itself
@@ -1124,6 +1144,21 @@ class UpdateWikidataCommand(QleverCommand):
                         "offset": first_offset_in_batch + current_batch_size,
                     }
                 ]
+
+            # If no events were processed (e.g., SSE connection dropped or
+            # returned 429), skip batch processing and reconnect.
+            if not use_cached_file and current_batch_size == 0:
+                log.warn(
+                    "No events processed in this batch; will reconnect"
+                )
+                event_id_for_next_batch = [
+                    {
+                        "topic": args.topic,
+                        "partition": args.partition,
+                        "offset": first_offset_in_batch,
+                    }
+                ]
+                continue
 
             # Process the current batch of messages (or skip if using cached).
             batch_count += 1
