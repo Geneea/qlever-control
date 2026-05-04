@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "geneea-wikidata-updater"
 description = "Keep a self-hosted Blazegraph synchronized with Wikidata via the public RDF update stream"
-version = "0.2.0"
+version = "0.2.1"
 authors = [
     { name = "Geneea", email = "support@geneea.com" }
 ]
