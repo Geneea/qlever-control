@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Event
 
 import rdflib.term
+import requests
 import requests_sse
 from rdflib import Graph
 from termcolor import colored
@@ -20,7 +21,6 @@ from tqdm.contrib.logging import tqdm_logging_redirect
 
 from qlever.command import QleverCommand
 from qlever.log import log
-from qlever.util import run_command
 
 
 # Monkey patch `rdflib.term._castLexicalToPython` to avoid casting of literals
@@ -33,7 +33,12 @@ def custom_cast_lexical_to_python(lexical, datatype):
 rdflib.term._castLexicalToPython = custom_cast_lexical_to_python
 
 
-def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
+DEFAULT_USER_AGENT = "qlever update-wikidata"
+
+
+def connect_to_sse_stream(
+    sse_stream_url, since=None, event_id=None, user_agent=None,
+):
     """
     Connect to the SSE stream and return the connected EventSource.
 
@@ -41,17 +46,21 @@ def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
         sse_stream_url: URL of the SSE stream
         since: ISO date string to start from (mutually exclusive with event_id)
         event_id: Event ID to resume from (mutually exclusive with since)
+        user_agent: User-Agent header value (default: qlever update-wikidata)
 
     Returns:
         The connected EventSource object
     """
+    if user_agent is None:
+        user_agent = DEFAULT_USER_AGENT
+
     if event_id:
         event_id_json = json.dumps(event_id)
         source = requests_sse.EventSource(
             sse_stream_url,
             headers={
                 "Accept": "text/event-stream",
-                "User-Agent": "qlever update-wikidata",
+                "User-Agent": user_agent,
                 "Last-Event-ID": event_id_json,
             },
         )
@@ -61,7 +70,7 @@ def connect_to_sse_stream(sse_stream_url, since=None, event_id=None):
             params={"since": since} if since else {},
             headers={
                 "Accept": "text/event-stream",
-                "User-Agent": "qlever update-wikidata",
+                "User-Agent": user_agent,
             },
         )
 
@@ -88,16 +97,18 @@ def get_next_offset_from_endpoint(sparql_endpoint):
         "wikibase:updateStreamNextOffset ?offset "
         "}"
     )
-    curl_cmd_check_offset = (
-        f"curl -s {sparql_endpoint}"
-        f' -H "Accept: text/csv"'
-        f' -H "Content-type: application/sparql-query"'
-        f' --data "{sparql_query_offset}"'
+    response = requests.post(
+        sparql_endpoint,
+        headers={
+            "Accept": "text/csv",
+            "Content-Type": "application/sparql-query",
+        },
+        data=sparql_query_offset,
     )
-    result = run_command(
-        f"{curl_cmd_check_offset} | sed 1d",
-        return_output=True,
-    ).strip()
+    response.raise_for_status()
+    # Skip CSV header line (equivalent of the previous `| sed 1d`).
+    lines = response.text.strip().splitlines()
+    result = lines[1].strip() if len(lines) > 1 else ""
     if not result:
         raise Exception("Query returned no results")
     return int(result.strip('"'))
@@ -293,6 +304,26 @@ class UpdateWikidataCommand(QleverCommand):
                     # If this was the last attempt, re-raise the exception.
                     raise
 
+    def _iter_sse_events(self, source):
+        """
+        Yield events from the SSE source, catching connection errors
+        (including HTTP 429) so that the caller can handle a partial or
+        empty batch gracefully instead of crashing.
+        """
+        try:
+            for event in source:
+                yield event
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.HTTPError,
+            requests.exceptions.Timeout,
+        ) as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None:
+                log.warn(f"SSE stream returned HTTP {status}: {e}")
+            else:
+                log.warn(f"SSE stream connection error: {e}")
+
     # Handle Ctrl+C gracefully by finishing the current batch and then exiting.
     def handle_ctrl_c(self, signal_received, frame):
         if self.ctrl_c_pressed.is_set():
@@ -337,24 +368,225 @@ class UpdateWikidataCommand(QleverCommand):
 
         return cached_file_name, batch_size
 
+    def parse_update_result(
+        self, result: str, args, curl_cmd: str,
+    ) -> dict | str:
+        """Parse the response from a SPARQL UPDATE request.
+
+        Returns a dict ``{"time_total_ms": <int>}`` on success, the string
+        ``"retry"`` when the batch should be retried, or ``"error"`` on
+        fatal failure.  Subclasses (e.g. for Blazegraph) may override this
+        method to handle a different response format.
+        """
+        # Results should be a JSON, parse it.
+        try:
+            parsed = json.loads(result)
+        except Exception as e:
+            log.error(
+                f"Error parsing JSON result: {e}. "
+                f"The first 1000 characters are: {result[:1000]}"
+            )
+            return "error"
+
+        # Check if the result contains a QLever exception.
+        if "exception" in parsed:
+            error_msg = parsed["exception"]
+            log.error(f"QLever exception: {error_msg}")
+            log.info("")
+            return "retry"
+
+        # Helper function for getting the value of `stats["time"][...]`
+        # without the "ms" suffix. If the extraction fails, return 0
+        # (and optionally log the failure).
+        class FailureMode(Enum):
+            LOG_ERROR = auto()
+            SILENTLY_RETURN_ZERO = auto()
+            THROW_EXCEPTION = auto()
+
+        def get_time_ms(
+            stats, *keys: str, failure_mode=FailureMode.LOG_ERROR
+        ) -> int:
+            try:
+                value = stats["time"]
+                for key in keys:
+                    value = value[key]
+                value = int(value)
+            except Exception:
+                if failure_mode == FailureMode.THROW_EXCEPTION:
+                    raise
+                elif failure_mode == FailureMode.LOG_ERROR:
+                    log.error(
+                        f"Error extracting time from JSON statistics, "
+                        f"keys: {keys}"
+                    )
+                value = 0
+            return value
+
+        # Check for old JSON format (no `operations` or `time` on top level).
+        old_json_message_template = (
+            "Result JSON does not contain `{}` field, you are "
+            "probably using an old version of QLever"
+        )
+        for field in ["operations", "time"]:
+            if field not in parsed:
+                raise RuntimeError(old_json_message_template.format(field))
+
+        # Get the per-operation statistics.
+        for i, stats in enumerate(parsed["operations"]):
+            try:
+                ins_after = stats["delta-triples"]["after"]["inserted"]
+                del_after = stats["delta-triples"]["after"]["deleted"]
+                ops_after = stats["delta-triples"]["after"]["total"]
+                num_ins = int(
+                    stats["delta-triples"]["operation"]["inserted"]
+                )
+                num_del = int(
+                    stats["delta-triples"]["operation"]["deleted"]
+                )
+                num_ops = int(stats["delta-triples"]["operation"]["total"])
+                time_op_total = get_time_ms(stats, "total")
+                time_us_per_op = (
+                    int(1000 * time_op_total / num_ops)
+                    if num_ops > 0
+                    else 0
+                )
+                if args.verbose == "yes":
+                    log.info(
+                        colored(
+                            f"TRIPLES: {num_ops:+10,} -> {ops_after:10,}, "
+                            f"INS: {num_ins:+10,} -> {ins_after:10,}, "
+                            f"DEL: {num_del:+10,} -> {del_after:10,}, "
+                            f"TIME: {time_op_total:7,}ms, "
+                            f"TIME/TRIPLE: {time_us_per_op:6,}µs",
+                            attrs=["bold"],
+                        )
+                    )
+
+                time_planning = get_time_ms(stats, "planning")
+                time_compute_ids = get_time_ms(
+                    stats,
+                    "execution",
+                    "computeIds",
+                    "total",
+                )
+                time_where = get_time_ms(
+                    stats,
+                    "execution",
+                    "evaluateWhere",
+                )
+                time_metadata = get_time_ms(
+                    stats,
+                    "updateMetadata",
+                )
+                time_insert = get_time_ms(
+                    stats,
+                    "execution",
+                    "insertTriples",
+                    "total",
+                    failure_mode=FailureMode.SILENTLY_RETURN_ZERO,
+                )
+                time_delete = get_time_ms(
+                    stats,
+                    "execution",
+                    "deleteTriples",
+                    "total",
+                    failure_mode=FailureMode.SILENTLY_RETURN_ZERO,
+                )
+                time_unaccounted = time_op_total - (
+                    time_planning
+                    + time_compute_ids
+                    + time_where
+                    + time_metadata
+                    + time_delete
+                    + time_insert
+                )
+                if args.verbose == "yes":
+                    log.info(
+                        f"METADATA: {100 * time_metadata / time_op_total:2.0f}%, "
+                        f"PLANNING: {100 * time_planning / time_op_total:2.0f}%, "
+                        f"WHERE: {100 * time_where / time_op_total:2.0f}%, "
+                        f"IDS: {100 * time_compute_ids / time_op_total:2.0f}%, "
+                        f"DELETE: {100 * time_delete / time_op_total:2.0f}%, "
+                        f"INSERT: {100 * time_insert / time_op_total:2.0f}%, "
+                        f"UNACCOUNTED: {100 * time_unaccounted / time_op_total:2.0f}%",
+                    )
+
+            except Exception as e:
+                log.warn(
+                    f"Error extracting statistics: {e}, "
+                    f"request was: {curl_cmd}"
+                )
+                # Show traceback for debugging.
+                import traceback
+
+                traceback.print_exc()
+                log.info("")
+                continue
+
+        # Get times for the whole request (not per operation).
+        time_parsing = get_time_ms(
+            parsed,
+            "parsing",
+        )
+        time_metadata = get_time_ms(
+            parsed,
+            "metadataUpdateForSnapshot",
+        )
+        time_snapshot = get_time_ms(
+            parsed,
+            "snapshotCreation",
+        )
+        time_writeback = get_time_ms(
+            parsed,
+            "diskWriteback",
+        )
+        time_operations = get_time_ms(
+            parsed,
+            "operations",
+        )
+        time_total = get_time_ms(
+            parsed,
+            "total",
+        )
+        time_unaccounted = time_total - (
+            time_parsing
+            + time_metadata
+            + time_snapshot
+            + time_writeback
+            + time_operations
+        )
+
+        # Show statistics for the completed batch.
+        if args.verbose == "yes":
+            log.info(
+                colored(
+                    f"TOTAL TIME FOR THIS UPDATE REQUEST: {time_total:7,}ms",
+                    attrs=["bold"],
+                )
+            )
+            log.info(
+                f"PARSING: {100 * time_parsing / time_total:2.0f}%, "
+                f"OPERATIONS: {100 * time_operations / time_total:2.0f}%, "
+                f"METADATA: {100 * time_metadata / time_total:2.0f}%, "
+                f"SNAPSHOT: {100 * time_snapshot / time_total:2.0f}%, "
+                f"WRITEBACK: {100 * time_writeback / time_total:2.0f}%, "
+                f"UNACCOUNTED: {100 * time_unaccounted / time_total:2.0f}%",
+            )
+            log.info("")
+
+        return {"time_total_ms": time_total}
+
     def execute(self, args) -> bool:
         # cURL command to get the date until which the updates of the
         # SPARQL endpoint are complete.
-        sparql_endpoint = f"http://{args.host_name}:{args.port}"
-        curl_cmd_updates_complete_until = (
-            f"curl -s {sparql_endpoint}"
-            f' -H "Accept: text/csv"'
-            f' -H "Content-type: application/sparql-query"'
-            f' --data "{self.sparql_updates_complete_until_query}"'
-        )
-
+        sparql_endpoint = getattr(args, "sparql_endpoint", None) or f"http://{args.host_name}:{args.port}"
         # Construct the command and show it.
         cmd_description = []
         if args.since:
             cmd_description.append(f"SINCE={args.since}")
         else:
             cmd_description.append(
-                f"SINCE=$({curl_cmd_updates_complete_until} | sed 1d)"
+                f"SINCE=<from SPARQL endpoint at {sparql_endpoint}>"
             )
         if args.until:
             cmd_description.append(f"UNTIL={args.until}")
@@ -362,8 +594,9 @@ class UpdateWikidataCommand(QleverCommand):
             f"Process SSE stream from {args.sse_stream_url} "
             f"in batches of up to {args.batch_size:,} messages "
         )
-        self.show("\n".join(cmd_description), only_show=args.show)
-        if args.show:
+        only_show = getattr(args, "show", False)
+        self.show("\n".join(cmd_description), only_show=only_show)
+        if only_show:
             return True
 
         # Compute the `since` date if not given.
@@ -371,13 +604,21 @@ class UpdateWikidataCommand(QleverCommand):
             since = args.since
         else:
             try:
-                since = run_command(
-                    f"{curl_cmd_updates_complete_until} | sed 1d",
-                    return_output=True,
-                ).strip()
+                response = requests.post(
+                    sparql_endpoint,
+                    headers={
+                        "Accept": "text/csv",
+                        "Content-Type": "application/sparql-query",
+                    },
+                    data=self.sparql_updates_complete_until_query,
+                )
+                response.raise_for_status()
+                lines = response.text.strip().splitlines()
+                since = lines[1].strip() if len(lines) > 1 else ""
             except Exception as e:
                 log.error(
-                    f"Error running `{curl_cmd_updates_complete_until}`: {e}"
+                    f"Error querying SPARQL endpoint for "
+                    f"updates_complete_until: {e}"
                 )
                 return False
 
@@ -405,7 +646,8 @@ class UpdateWikidataCommand(QleverCommand):
             try:
                 source = self.retry_with_backoff(
                     lambda: connect_to_sse_stream(
-                        args.sse_stream_url, since=since
+                        args.sse_stream_url, since=since,
+                        user_agent=getattr(args, "user_agent", None),
                     ),
                     "SSE stream connection",
                     args.num_retries,
@@ -507,6 +749,7 @@ class UpdateWikidataCommand(QleverCommand):
                         args.sse_stream_url,
                         since=since if not event_id_for_next_batch else None,
                         event_id=event_id_for_next_batch,
+                        user_agent=getattr(args, "user_agent", None),
                     ),
                     "SSE stream connection for batch processing",
                     args.num_retries,
@@ -638,7 +881,7 @@ class UpdateWikidataCommand(QleverCommand):
                     leave=False,
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}",
                 ) as pbar:
-                    for event in source:
+                    for event in self._iter_sse_events(source):
                         # Skip events that are not of type `message` (should not
                         # happen), have no field `data` (should not happen either), or
                         # where the topic is not in `args.topics` (one topic by itself
@@ -902,6 +1145,21 @@ class UpdateWikidataCommand(QleverCommand):
                     }
                 ]
 
+            # If no events were processed (e.g., SSE connection dropped or
+            # returned 429), skip batch processing and reconnect.
+            if not use_cached_file and current_batch_size == 0:
+                log.warn(
+                    "No events processed in this batch; will reconnect"
+                )
+                event_id_for_next_batch = [
+                    {
+                        "topic": args.topic,
+                        "partition": args.partition,
+                        "offset": first_offset_in_batch,
+                    }
+                ]
+                continue
+
             # Process the current batch of messages (or skip if using cached).
             batch_count += 1
             if not use_cached_file:
@@ -976,12 +1234,12 @@ class UpdateWikidataCommand(QleverCommand):
                     )
                     delete_insert_operation += ";\n" + delete_where_operation
 
-            # Construct curl command. For batch size 1, send the operation via
-            # `--data-urlencode`, otherwise write to file and send via `--data-binary`.
-            curl_cmd = (
-                f"curl -s -X POST"
-                f' "{sparql_endpoint}?access-token={args.access_token}"'
-                f" -H 'Content-Type: application/sparql-update'"
+            # Prepare the SPARQL UPDATE request.
+            access_token = getattr(args, "access_token", None)
+            endpoint_url = (
+                f"{sparql_endpoint}?access-token={access_token}"
+                if access_token
+                else sparql_endpoint
             )
             if use_cached_file:
                 # Use the cached file instead of writing a new one
@@ -997,9 +1255,9 @@ class UpdateWikidataCommand(QleverCommand):
                 )
                 with open(meta_file_name, "w") as f:
                     f.write(f"{date_list[0]} - {date_list[-1]}")
-            curl_cmd += f" --data-binary @{update_arg_file_name}"
+            request_desc = f"POST {endpoint_url} @{update_arg_file_name}"
             if args.verbose == "yes":
-                log.info(colored(curl_cmd, "blue"))
+                log.info(colored(request_desc, "blue"))
 
             # Send the UPDATE request. If it fails, reset to the beginning
             # of this batch and retry in the next iteration of the outer
@@ -1008,7 +1266,14 @@ class UpdateWikidataCommand(QleverCommand):
             # restarted, the offset check at the beginning of the next
             # iteration will detect the mismatch and rewind.
             try:
-                result = run_command(curl_cmd, return_output=True)
+                with open(update_arg_file_name, "rb") as f:
+                    update_data = f.read()
+                response = requests.post(
+                    endpoint_url,
+                    headers={"Content-Type": "application/sparql-update; charset=UTF-8"},
+                    data=update_data,
+                )
+                result = response.text
             except Exception:
                 if self.ctrl_c_pressed.is_set():
                     log.warn(
@@ -1075,206 +1340,25 @@ class UpdateWikidataCommand(QleverCommand):
                             except Exception:
                                 pass  # Ignore errors during cleanup
 
-            # Results should be a JSON, parse it.
-            try:
-                result = json.loads(result)
-            except Exception as e:
-                log.error(
-                    f"Error parsing JSON result: {e}. "
-                    f"The first 1000 characters are: {result[:1000]}"
-                )
+            # Parse the result and log statistics.  Subclasses may
+            # override ``parse_update_result`` for different backends.
+            parse_status = self.parse_update_result(result, args, request_desc)
+            if parse_status == "error":
                 return False
-
-            # Check if the result contains a QLever exception.
-            if "exception" in result:
-                error_msg = result["exception"]
-                log.error(f"QLever exception: {error_msg}")
-                log.info("")
+            if parse_status == "retry":
                 continue
 
-            # Helper function for getting the value of `stats["time"][...]`
-            # without the "ms" suffix. If the extraction fails, return 0
-
-            # (and optionally log the failure).
-            class FailureMode(Enum):
-                LOG_ERROR = auto()
-                SILENTLY_RETURN_ZERO = auto()
-                THROW_EXCEPTION = auto()
-
-            def get_time_ms(
-                stats, *keys: str, failure_mode=FailureMode.LOG_ERROR
-            ) -> int:
-                try:
-                    value = stats["time"]
-                    for key in keys:
-                        value = value[key]
-                    value = int(value)
-                except Exception:
-                    if failure_mode == FailureMode.THROW_EXCEPTION:
-                        raise
-                    elif failure_mode == FailureMode.LOG_ERROR:
-                        log.error(
-                            f"Error extracting time from JSON statistics, "
-                            f"keys: {keys}"
-                        )
-                    value = 0
-                return value
-
-            # Check for old JSON format (no `operations` or `time` on top level).
-            old_json_message_template = (
-                "Result JSON does not contain `{}` field, you are "
-                "probably using an old version of QLever"
-            )
-            for field in ["operations", "time"]:
-                if field not in result:
-                    raise RuntimeError(old_json_message_template.format(field))
-
-            # Get the per-operation statistics.
-            for i, stats in enumerate(result["operations"]):
-                try:
-                    ins_after = stats["delta-triples"]["after"]["inserted"]
-                    del_after = stats["delta-triples"]["after"]["deleted"]
-                    ops_after = stats["delta-triples"]["after"]["total"]
-                    num_ins = int(
-                        stats["delta-triples"]["operation"]["inserted"]
-                    )
-                    num_del = int(
-                        stats["delta-triples"]["operation"]["deleted"]
-                    )
-                    num_ops = int(stats["delta-triples"]["operation"]["total"])
-                    time_op_total = get_time_ms(stats, "total")
-                    time_us_per_op = (
-                        int(1000 * time_op_total / num_ops)
-                        if num_ops > 0
-                        else 0
-                    )
-                    if args.verbose == "yes":
-                        log.info(
-                            colored(
-                                f"TRIPLES: {num_ops:+10,} -> {ops_after:10,}, "
-                                f"INS: {num_ins:+10,} -> {ins_after:10,}, "
-                                f"DEL: {num_del:+10,} -> {del_after:10,}, "
-                                f"TIME: {time_op_total:7,}ms, "
-                                f"TIME/TRIPLE: {time_us_per_op:6,}µs",
-                                attrs=["bold"],
-                            )
-                        )
-
-                    time_planning = get_time_ms(stats, "planning")
-                    time_compute_ids = get_time_ms(
-                        stats,
-                        "execution",
-                        "computeIds",
-                        "total",
-                    )
-                    time_where = get_time_ms(
-                        stats,
-                        "execution",
-                        "evaluateWhere",
-                    )
-                    time_metadata = get_time_ms(
-                        stats,
-                        "updateMetadata",
-                    )
-                    time_insert = get_time_ms(
-                        stats,
-                        "execution",
-                        "insertTriples",
-                        "total",
-                        failure_mode=FailureMode.SILENTLY_RETURN_ZERO,
-                    )
-                    time_delete = get_time_ms(
-                        stats,
-                        "execution",
-                        "deleteTriples",
-                        "total",
-                        failure_mode=FailureMode.SILENTLY_RETURN_ZERO,
-                    )
-                    time_unaccounted = time_op_total - (
-                        time_planning
-                        + time_compute_ids
-                        + time_where
-                        + time_metadata
-                        + time_delete
-                        + time_insert
-                    )
-                    if args.verbose == "yes":
-                        log.info(
-                            f"METADATA: {100 * time_metadata / time_op_total:2.0f}%, "
-                            f"PLANNING: {100 * time_planning / time_op_total:2.0f}%, "
-                            f"WHERE: {100 * time_where / time_op_total:2.0f}%, "
-                            f"IDS: {100 * time_compute_ids / time_op_total:2.0f}%, "
-                            f"DELETE: {100 * time_delete / time_op_total:2.0f}%, "
-                            f"INSERT: {100 * time_insert / time_op_total:2.0f}%, "
-                            f"UNACCOUNTED: {100 * time_unaccounted / time_op_total:2.0f}%",
-                        )
-
-                except Exception as e:
-                    log.warn(
-                        f"Error extracting statistics: {e}, "
-                        f"curl command was: {curl_cmd}"
-                    )
-                    # Show traceback for debugging.
-                    import traceback
-
-                    traceback.print_exc()
-                    log.info("")
-                    continue
-
-            # Get times for the whole request (not per operation).
-            time_parsing = get_time_ms(
-                result,
-                "parsing",
-            )
-            time_metadata = get_time_ms(
-                result,
-                "metadataUpdateForSnapshot",
-            )
-            time_snapshot = get_time_ms(
-                result,
-                "snapshotCreation",
-            )
-            time_writeback = get_time_ms(
-                result,
-                "diskWriteback",
-            )
-            time_operations = get_time_ms(
-                result,
-                "operations",
-            )
-            time_total = get_time_ms(
-                result,
-                "total",
-            )
-            time_unaccounted = time_total - (
-                time_parsing
-                + time_metadata
-                + time_snapshot
-                + time_writeback
-                + time_operations
-            )
-
             # Update the totals.
-            total_update_time += time_total / 1000.0
+            total_update_time += parse_status.get("time_total_ms", 0) / 1000.0
             total_elapsed_time = time.perf_counter() - start_time
 
-            # Show statistics for the completed batch.
             if args.verbose == "yes":
                 log.info(
                     colored(
                         f"TOTAL UPDATE TIME SO FAR: {total_update_time:4.0f}s, "
-                        f"TOTAL ELAPSED TIME SO FAR: {total_elapsed_time:4.0f}s, "
-                        f"TOTAL TIME FOR THIS UPDATE REQUEST: {time_total:7,}ms, ",
+                        f"TOTAL ELAPSED TIME SO FAR: {total_elapsed_time:4.0f}s",
                         attrs=["bold"],
                     )
-                )
-                log.info(
-                    f"PARSING: {100 * time_parsing / time_total:2.0f}%, "
-                    f"OPERATIONS: {100 * time_operations / time_total:2.0f}%, "
-                    f"METADATA: {100 * time_metadata / time_total:2.0f}%, "
-                    f"SNAPSHOT: {100 * time_snapshot / time_total:2.0f}%, "
-                    f"WRITEBACK: {100 * time_writeback / time_total:2.0f}%, "
-                    f"UNACCOUNTED: {100 * time_unaccounted / time_total:2.0f}%",
                 )
                 log.info("")
 
