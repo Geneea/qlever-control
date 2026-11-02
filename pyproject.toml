@@ -31,7 +31,7 @@ repository = "https://github.com/Geneea/qlever-control.git"
 bugtracker = "https://github.com/Geneea/qlever-control/issues"
 
 [project.scripts]
-"geneea-wikidata-updater" = "qlever.commands.blazegraph_wikidata_updater:main"
+"geneea-wikidata-updater" = "qlever.blazegraph_wikidata_updater:main"
 
 # Only ship the qlever core and commands packages (no Qleverfiles data).
 # Note: setuptools cannot exclude individual .py files from a package,

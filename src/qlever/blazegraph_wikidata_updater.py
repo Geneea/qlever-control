@@ -5,7 +5,7 @@ Blazegraph instance instead of QLever.
 
 Usage::
 
-    python -m qlever.commands.blazegraph_wikidata_updater \
+    python -m qlever.blazegraph_wikidata_updater \
         http://localhost:9999/bigdata/namespace/wdq/sparql
 
 All other flags (--batch-size, --since, --offset, …) are the same as
@@ -22,10 +22,8 @@ import xml.etree.ElementTree as ET
 from qlever.commands.update_wikidata import UpdateWikidataCommand
 from qlever.log import log
 
-
 DEFAULT_BLAZEGRAPH_USER_AGENT = (
-    "Geneea-BlazegraphUpdater/1.0"
-    " (https://geneea.com; support@geneea.com)"
+    "Geneea-BlazegraphUpdater/1.0 (https://geneea.com; support@geneea.com)"
 )
 
 
@@ -33,7 +31,10 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
     """Subclass that overrides only what differs for Blazegraph."""
 
     def parse_update_result(
-        self, result: str, args, curl_cmd: str,
+        self,
+        result: str,
+        args,
+        curl_cmd: str,
     ) -> dict | str:
         """Parse a Blazegraph SPARQL UPDATE response.
 
@@ -70,8 +71,7 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
             verbose = getattr(args, "verbose", "no")
             if verbose == "yes":
                 log.info(
-                    f"Blazegraph: modified={modified} triples, "
-                    f"time={millis}ms"
+                    f"Blazegraph: modified={modified} triples, time={millis}ms"
                 )
             return {"time_total_ms": millis}
         except ET.ParseError:
@@ -114,9 +114,13 @@ class BlazegraphWikidataUpdater(UpdateWikidataCommand):
         # If we got HTML but no recognizable stats, it's likely an error.
         if "<html" in result.lower():
             title_match = re.search(
-                r"<title>(.*?)</title>", result, re.IGNORECASE | re.DOTALL,
+                r"<title>(.*?)</title>",
+                result,
+                re.IGNORECASE | re.DOTALL,
             )
-            error_msg = title_match.group(1).strip() if title_match else "unknown"
+            error_msg = (
+                title_match.group(1).strip() if title_match else "unknown"
+            )
             log.error(
                 f"Blazegraph returned an error page: {error_msg}. "
                 f"First 500 chars: {result[:500]}"

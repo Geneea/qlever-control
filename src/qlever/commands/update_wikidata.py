@@ -1551,7 +1551,9 @@ class UpdateWikidataCommand(QleverCommand):
                     update_data = f.read()
                 response = requests.post(
                     endpoint_url,
-                    headers={"Content-Type": "application/sparql-update; charset=UTF-8"},
+                    headers={
+                        "Content-Type": "application/sparql-update; charset=UTF-8"
+                    },
                     data=update_data,
                 )
                 result = response.text
