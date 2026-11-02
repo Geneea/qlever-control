@@ -727,8 +727,6 @@ class UpdateWikidataCommand(QleverCommand):
             if getattr(args, arg_name) is None:
                 setattr(args, arg_name, default_value)
 
-        # cURL command to get the date until which the updates of the
-        # SPARQL endpoint are complete.
         sparql_endpoint = (
             getattr(args, "sparql_endpoint", None)
             or f"http://{args.host_name}:{args.port}"
