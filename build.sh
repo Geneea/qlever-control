@@ -77,8 +77,8 @@ echo "--------------------------------"
 echo "Installing the package and test dependencies..."
 echo "--------------------------------"
 uv pip install -e .
-# pyyaml and argcomplete are needed by upstream tests but not by the updater itself
-uv pip install pyyaml argcomplete
+# Needed by upstream tests (full qlever CLI) but not by the updater itself
+uv pip install pyyaml argcomplete "textual>=8.0,<9" textual-plotext rich
 
 echo "--------------------------------"
 echo "Running tests..."
